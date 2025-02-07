@@ -4,6 +4,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- Types
 CREATE TYPE reservation_status AS ENUM (
   'in_cart',
+  'in_queue',
   'reserved',
   'sold',
   'cancelled'
@@ -34,8 +35,13 @@ CREATE TABLE reservations (
   release_id BIGINT NOT NULL,
   session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
   status reservation_status NOT NULL DEFAULT 'in_cart',
+  position_in_queue INTEGER,
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT valid_queue_position CHECK (
+    (status = 'in_queue' AND position_in_queue IS NOT NULL) OR
+    (status != 'in_queue' AND position_in_queue IS NULL)
+  )
 );
 
 -- Basic audit
@@ -50,6 +56,8 @@ CREATE TABLE audit_logs (
 -- Indexes
 CREATE INDEX idx_sessions_fingerprint ON sessions (fingerprint);
 CREATE INDEX idx_reservations_status ON reservations (status, created_at DESC);
+CREATE INDEX idx_reservations_queue ON reservations (release_id, position_in_queue) 
+  WHERE status = 'in_queue';
 CREATE INDEX idx_audit_session ON audit_logs (session_id, created_at DESC);
 
 -- RLS
@@ -86,29 +94,52 @@ CREATE POLICY "Audit logs viewable by admin"
   ON audit_logs FOR SELECT
   USING (is_admin());
 
--- Helper function
-CREATE OR REPLACE FUNCTION create_session(
-  p_fingerprint text,
-  p_alias text
+-- Queue management function
+CREATE OR REPLACE FUNCTION manage_queue_position(
+  p_release_id bigint,
+  p_session_id uuid
 ) RETURNS TABLE (
-  session_id uuid,
-  expires_at timestamptz
+  reservation_id uuid,
+  queue_position integer
 ) LANGUAGE plpgsql SECURITY DEFINER AS $$
 DECLARE
-  v_session_id uuid;
-  v_expires_at timestamptz;
+  v_position integer;
+  v_reservation_id uuid;
 BEGIN
-  INSERT INTO sessions (
-    fingerprint,
-    alias,
-    expires_at
-  ) VALUES (
-    p_fingerprint,
-    p_alias,
-    NOW() + INTERVAL '30 days'
-  )
-  RETURNING id, expires_at INTO v_session_id, v_expires_at;
+  -- Check if release is available
+  IF NOT EXISTS (
+    SELECT 1 FROM reservations 
+    WHERE release_id = p_release_id 
+    AND status IN ('reserved', 'in_cart')
+  ) THEN
+    -- Direct reservation (no queue needed)
+    INSERT INTO reservations (release_id, session_id, status)
+    VALUES (p_release_id, p_session_id, 'in_cart')
+    RETURNING id INTO v_reservation_id;
+    
+    RETURN QUERY SELECT v_reservation_id, NULL::integer;
+    RETURN;
+  END IF;
 
-  RETURN QUERY SELECT v_session_id, v_expires_at;
+  -- Add to queue
+  SELECT COALESCE(MAX(position_in_queue), 0) + 1
+  INTO v_position
+  FROM reservations
+  WHERE release_id = p_release_id AND status = 'in_queue';
+
+  INSERT INTO reservations (
+    release_id,
+    session_id,
+    status,
+    position_in_queue
+  ) VALUES (
+    p_release_id,
+    p_session_id,
+    'in_queue',
+    v_position
+  ) RETURNING id INTO v_reservation_id;
+
+  -- Return reservation info
+  RETURN QUERY SELECT v_reservation_id, v_position;
 END;
 $$;
